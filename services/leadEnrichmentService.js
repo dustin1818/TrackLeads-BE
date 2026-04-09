@@ -1,12 +1,20 @@
 const axios = require("axios");
 const dns = require("dns").promises;
 
-const MAX_LEADS_TO_RETURN = 20;
-const MAX_CANDIDATES_TO_VERIFY = 500;
-const LIVE_DOMAIN_CHECK_CONCURRENCY = 6;
-const MAX_RELATED_SEED_LEADS = 12;
 
-const REGION_GROUPS = [
+const CONFIG = {
+  maxLeadsToReturn: 20,
+  maxCandidatesToVerify: 500,
+  domainCheckConcurrency: 6,
+  maxRelatedSeedLeads: 12,
+  rateLimitDelay: 2000,
+  apiTimeout: 60000,
+  domainCheckTimeout: 4000,
+  priorityRegion: "Philippines",
+};
+
+
+const WORLD_REGIONS = [
   "North America and Central America",
   "South America and the Caribbean",
   "Western Europe and Scandinavia",
@@ -18,248 +26,221 @@ const REGION_GROUPS = [
   "Australia, New Zealand, and Pacific Islands",
 ];
 
-const getRandomRegions = (count = 3) => {
-  const shuffled = [...REGION_GROUPS].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, count).join(", ");
-};
+const GENERATION_TIERS = [
+  { name: "supplemental", targetCount: 120, temperature: 0.8 },
+  { name: "expansion", targetCount: 160, temperature: 0.9, longTail: true },
+  {
+    name: "fallback",
+    targetCount: 200,
+    temperature: 1.0,
+    industryFallback: true,
+  },
+];
+
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Generate leads from a website URL using an external enrichment API.
- * Abstracts the provider so it can be swapped without touching controllers.
- *
- * @param {string} websiteUrl - The user's website URL
- * @param {object|string[]} excludedLeads - Saved/removed lead exclusion info
- * @returns {Promise<Array>} Array of 20 lead objects
- */
-const generateLeadsFromWebsite = async (websiteUrl, excludedLeads = {}) => {
-  const domain = new URL(websiteUrl).hostname.replace("www.", "");
-  const inferredIndustry = inferIndustryFromContext(domain);
-  const provider = (
-    process.env.LEAD_ENRICHMENT_PROVIDER || "groq"
-  ).toLowerCase();
+const normalizeDomain = (value) =>
+  String(value || "")
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .split("/")[0]
+    .trim();
 
-  const excludedEmailSet = new Set();
-  const excludedDomainSet = new Set();
-  const excludedCompanySet = new Set();
+const normalizeCompanyName = (value) =>
+  String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const getRandomRegions = (count = 3) => {
+  const shuffled = [...WORLD_REGIONS].sort(() => Math.random() - 0.5);
+  return [CONFIG.priorityRegion, ...shuffled.slice(0, count - 1)].join(", ");
+};
+
+
+const buildExclusionSets = (excludedLeads) => {
+  const emails = new Set();
+  const domains = new Set();
+  const companies = new Set();
 
   if (Array.isArray(excludedLeads)) {
-    excludedLeads.forEach((email) => {
-      if (email) excludedEmailSet.add(String(email).toLowerCase());
-    });
+    excludedLeads.forEach((e) => e && emails.add(String(e).toLowerCase()));
   } else {
-    (excludedLeads.emails || []).forEach((email) => {
-      if (email) excludedEmailSet.add(String(email).toLowerCase());
+    (excludedLeads.emails || []).forEach(
+      (e) => e && emails.add(String(e).toLowerCase()),
+    );
+    (excludedLeads.domains || []).forEach((v) => {
+      const d = normalizeDomain(v);
+      if (d) domains.add(d);
     });
-    (excludedLeads.domains || []).forEach((value) => {
-      const normalized = normalizeDomain(value);
-      if (normalized) excludedDomainSet.add(normalized);
-    });
-    (excludedLeads.companyNames || []).forEach((value) => {
-      const normalized = normalizeCompanyName(value);
-      if (normalized) excludedCompanySet.add(normalized);
+    (excludedLeads.companyNames || []).forEach((v) => {
+      const c = normalizeCompanyName(v);
+      if (c) companies.add(c);
     });
   }
 
-  let companies = [];
+  return { emails, domains, companies };
+};
+
+const expandExclusions = (base, ...leadArrays) => {
+  const all = leadArrays.flat();
+  return {
+    emails: new Set([...base.emails, ...all.map((l) => l.email)]),
+    domains: new Set([...base.domains, ...all.map((l) => l.domain)]),
+    companies: new Set([
+      ...base.companies,
+      ...all.map((l) => l.normalizedCompanyName),
+    ]),
+  };
+};
+
+const generateLeadsFromWebsite = async (websiteUrl, excludedLeads = {}) => {
+  const domain = new URL(websiteUrl).hostname.replace("www.", "");
+  const provider = (
+    process.env.LEAD_ENRICHMENT_PROVIDER || "groq"
+  ).toLowerCase();
+  const inferredIndustry = inferIndustryFromContext(domain);
+  const exclusions = buildExclusionSets(excludedLeads);
+
+  const rawCompanies = await fetchInitialCompanies(
+    domain,
+    provider,
+    inferredIndustry,
+    exclusions,
+  );
+
+  const initialLeads = dedupeLeads(
+    normalizeLeadResults(rawCompanies, domain, exclusions),
+  );
+
+  let verified = await filterLiveLeads(
+    initialLeads.slice(0, CONFIG.maxCandidatesToVerify),
+    CONFIG.maxLeadsToReturn,
+  );
+
+  for (const tier of GENERATION_TIERS) {
+    if (verified.length >= CONFIG.maxLeadsToReturn) break;
+
+    const industry =
+      inferredIndustry || inferIndustryFromContext(domain, verified);
+    const grown = expandExclusions(exclusions, initialLeads, verified);
+
+    await delay(CONFIG.rateLimitDelay);
+
+    const tierCompanies = await fetchTierCompanies({
+      tier,
+      domain,
+      provider,
+      industry,
+      verified,
+      exclusions: grown,
+    });
+
+    if (tier.name === "expansion") {
+      await delay(CONFIG.rateLimitDelay); 
+    }
+
+    const tierLeads = dedupeLeads(
+      normalizeLeadResults(tierCompanies, domain, grown),
+    );
+    const remaining = CONFIG.maxLeadsToReturn - verified.length;
+    const verifiedTier = await filterLiveLeads(
+      tierLeads.slice(0, CONFIG.maxCandidatesToVerify),
+      remaining,
+    );
+
+    verified = dedupeLeads([...verified, ...verifiedTier]).slice(
+      0,
+      CONFIG.maxLeadsToReturn,
+    );
+  }
+
+  return verified.map(({ normalizedCompanyName, ...lead }) => lead);
+};
+
+
+const fetchInitialCompanies = async (
+  domain,
+  provider,
+  industry,
+  exclusions,
+) => {
+  try {
+    switch (provider) {
+      case "groq":
+        return await fetchFromGroq(domain, exclusions.emails, { industry });
+      case "ai":
+      case "openai":
+        return await fetchFromAIProvider(domain, exclusions.emails, {
+          industry,
+        });
+      case "apollo":
+        return await fetchFromApollo(domain);
+      case "hunter":
+        return await fetchFromHunter(domain);
+      default:
+        return generateFallbackLeads(domain, [], industry);
+    }
+  } catch (error) {
+    console.error(`Initial fetch error (${provider}):`, error.message);
+    return generateFallbackLeads(domain, [], industry);
+  }
+};
+
+const fetchTierCompanies = async ({
+  tier,
+  domain,
+  provider,
+  industry,
+  verified,
+  exclusions,
+}) => {
+  const industryLabel = industry
+    ? `${industry} industry`
+    : "the same industry as the source website";
+
+  const options = {
+    industry,
+    industryLabel,
+    targetCount: tier.targetCount,
+    temperature: tier.temperature,
+    excludedDomainSet: exclusions.domains,
+    excludedCompanySet: exclusions.companies,
+    relatedLeads: verified.slice(0, CONFIG.maxRelatedSeedLeads),
+    longTailIndustrySearch: tier.longTail || false,
+    industryFallback: tier.industryFallback || false,
+  };
 
   try {
     switch (provider) {
       case "groq":
-        companies = await fetchFromGroq(domain, excludedEmailSet, {
-          industry: inferredIndustry,
-        });
-        break;
+        return await fetchFromGroq(domain, exclusions.emails, options);
       case "ai":
       case "openai":
-        companies = await fetchFromAIProvider(domain, excludedEmailSet, {
-          industry: inferredIndustry,
-        });
-        break;
-      case "apollo":
-        companies = await fetchFromApollo(domain);
-        break;
-      case "hunter":
-        companies = await fetchFromHunter(domain);
-        break;
+        return await fetchFromAIProvider(domain, exclusions.emails, options);
       default:
-        companies = generatePopularFallbackLeads(domain, [], inferredIndustry);
+        return tier.industryFallback
+          ? generateFallbackLeads(domain, verified, industry)
+          : [];
     }
   } catch (error) {
-    console.error(`Lead enrichment API error (${provider}):`, error.message);
-    companies = generatePopularFallbackLeads(domain, [], inferredIndustry);
+    console.error(`Tier "${tier.name}" error:`, error.message);
+    return tier.industryFallback
+      ? generateFallbackLeads(domain, verified, industry)
+      : [];
   }
-
-  const deduped = dedupeLeads(
-    normalizeLeadResults(companies, domain, {
-      excludedEmailSet,
-      excludedDomainSet,
-      excludedCompanySet,
-    }),
-  );
-
-  // Verify candidate domains before returning leads so expired or dead sites are filtered out.
-  let verifiedLeads = await filterLiveLeads(
-    deduped.slice(0, MAX_CANDIDATES_TO_VERIFY),
-    MAX_LEADS_TO_RETURN,
-  );
-
-  if (verifiedLeads.length < MAX_LEADS_TO_RETURN) {
-    await delay(2000); // avoid 429 rate limit
-    const supplementalCompanies = await fetchSupplementalCompanies({
-      domain,
-      industry: inferredIndustry,
-      provider,
-      verifiedLeads,
-      excludedEmailSet,
-      excludedDomainSet,
-      excludedCompanySet,
-    });
-
-    const supplementalLeads = dedupeLeads(
-      normalizeLeadResults(supplementalCompanies, domain, {
-        excludedEmailSet: new Set([
-          ...excludedEmailSet,
-          ...deduped.map((lead) => lead.email),
-          ...verifiedLeads.map((lead) => lead.email),
-        ]),
-        excludedDomainSet: new Set([
-          ...excludedDomainSet,
-          ...deduped.map((lead) => lead.domain),
-          ...verifiedLeads.map((lead) => lead.domain),
-        ]),
-        excludedCompanySet: new Set([
-          ...excludedCompanySet,
-          ...deduped.map((lead) => lead.normalizedCompanyName),
-          ...verifiedLeads.map((lead) => lead.normalizedCompanyName),
-        ]),
-      }),
-    );
-
-    const remainingSlots = MAX_LEADS_TO_RETURN - verifiedLeads.length;
-    const verifiedSupplemental = await filterLiveLeads(
-      supplementalLeads.slice(0, MAX_CANDIDATES_TO_VERIFY),
-      remainingSlots,
-    );
-
-    verifiedLeads = dedupeLeads([
-      ...verifiedLeads,
-      ...verifiedSupplemental,
-    ]).slice(0, MAX_LEADS_TO_RETURN);
-  }
-
-  if (verifiedLeads.length < MAX_LEADS_TO_RETURN) {
-    const industry =
-      inferredIndustry || inferIndustryFromContext(domain, verifiedLeads);
-    const allExcludedEmails = new Set([
-      ...excludedEmailSet,
-      ...deduped.map((lead) => lead.email),
-      ...verifiedLeads.map((lead) => lead.email),
-    ]);
-    const allExcludedDomains = new Set([
-      ...excludedDomainSet,
-      ...deduped.map((lead) => lead.domain),
-      ...verifiedLeads.map((lead) => lead.domain),
-    ]);
-    const allExcludedCompanies = new Set([
-      ...excludedCompanySet,
-      ...deduped.map((lead) => lead.normalizedCompanyName),
-      ...verifiedLeads.map((lead) => lead.normalizedCompanyName),
-    ]);
-
-    await delay(2000); // avoid 429 rate limit
-    const industryExpansionCompanies = await fetchIndustryExpansionCompanies({
-      domain,
-      provider,
-      industry,
-      verifiedLeads,
-      excludedEmailSet: allExcludedEmails,
-      excludedDomainSet: allExcludedDomains,
-      excludedCompanySet: allExcludedCompanies,
-    });
-
-    // delay was already applied before the expansion tier block
-    await delay(2000); // avoid 429 before potential fallback tier
-
-    const industryExpansionLeads = dedupeLeads(
-      normalizeLeadResults(industryExpansionCompanies, domain, {
-        excludedEmailSet: allExcludedEmails,
-        excludedDomainSet: allExcludedDomains,
-        excludedCompanySet: allExcludedCompanies,
-      }),
-    );
-
-    const remainingAfterExpansion = MAX_LEADS_TO_RETURN - verifiedLeads.length;
-    const verifiedIndustryExpansion = await filterLiveLeads(
-      industryExpansionLeads.slice(0, MAX_CANDIDATES_TO_VERIFY),
-      remainingAfterExpansion,
-    );
-
-    verifiedLeads = dedupeLeads([
-      ...verifiedLeads,
-      ...verifiedIndustryExpansion,
-    ]).slice(0, MAX_LEADS_TO_RETURN);
-  }
-
-  if (verifiedLeads.length < MAX_LEADS_TO_RETURN) {
-    const industry =
-      inferredIndustry || inferIndustryFromContext(domain, verifiedLeads);
-    const allExcludedEmails = new Set([
-      ...excludedEmailSet,
-      ...deduped.map((lead) => lead.email),
-      ...verifiedLeads.map((lead) => lead.email),
-    ]);
-    const allExcludedDomains = new Set([
-      ...excludedDomainSet,
-      ...deduped.map((lead) => lead.domain),
-      ...verifiedLeads.map((lead) => lead.domain),
-    ]);
-    const allExcludedCompanies = new Set([
-      ...excludedCompanySet,
-      ...deduped.map((lead) => lead.normalizedCompanyName),
-      ...verifiedLeads.map((lead) => lead.normalizedCompanyName),
-    ]);
-
-    const industryFallbackCompanies = await fetchIndustryFallbackCompanies({
-      domain,
-      provider,
-      industry,
-      verifiedLeads,
-      excludedEmailSet: allExcludedEmails,
-      excludedDomainSet: allExcludedDomains,
-      excludedCompanySet: allExcludedCompanies,
-    });
-
-    const industryFallbackLeads = dedupeLeads(
-      normalizeLeadResults(industryFallbackCompanies, domain, {
-        excludedEmailSet: allExcludedEmails,
-        excludedDomainSet: allExcludedDomains,
-        excludedCompanySet: allExcludedCompanies,
-      }),
-    );
-
-    const remainingSlots = MAX_LEADS_TO_RETURN - verifiedLeads.length;
-    const verifiedIndustryFallback = await filterLiveLeads(
-      industryFallbackLeads.slice(0, MAX_CANDIDATES_TO_VERIFY),
-      remainingSlots,
-    );
-
-    verifiedLeads = dedupeLeads([
-      ...verifiedLeads,
-      ...verifiedIndustryFallback,
-    ]).slice(0, MAX_LEADS_TO_RETURN);
-  }
-
-  return verifiedLeads.map(({ normalizedCompanyName, ...lead }) => lead);
 };
+
 
 const fetchFromGroq = async (
   domain,
-  savedEmailSet = new Set(),
+  excludedEmails = new Set(),
   options = {},
 ) => {
-  return fetchFromAIProvider(domain, savedEmailSet, {
+  return fetchFromAIProvider(domain, excludedEmails, {
     ...options,
     apiKey: process.env.GROQ_API_KEY || process.env.AI_API_KEY,
     baseUrl: process.env.GROQ_BASE_URL || "https://api.groq.com/openai/v1",
@@ -269,7 +250,7 @@ const fetchFromGroq = async (
 
 const fetchFromAIProvider = async (
   domain,
-  excludedEmailSet = new Set(),
+  excludedEmails = new Set(),
   options = {},
 ) => {
   const apiKey =
@@ -281,55 +262,10 @@ const fetchFromAIProvider = async (
     options.baseUrl || process.env.AI_BASE_URL || "https://api.openai.com/v1";
   const model = options.model || process.env.AI_MODEL || "gpt-4o-mini";
 
-  if (!apiKey) {
+  if (!apiKey)
     throw new Error("Missing AI API key. Set AI_API_KEY or OPENAI_API_KEY.");
-  }
 
-  // Only send a tiny sample of exclusions in the prompt to avoid bloating it.
-  // Full dedup is handled post-generation by normalizeLeadResults filtering.
-  const excludedDomainsSample = Array.from(options.excludedDomainSet || [])
-    .slice(-15)
-    .join(", ");
-  const regionFocus = getRandomRegions(3);
-  const relatedLeadSummary = (options.relatedLeads || [])
-    .slice(0, MAX_RELATED_SEED_LEADS)
-    .map((lead) => `${lead.companyName} (${lead.domain})`)
-    .join(", ");
-  const targetCount = options.targetCount || 120;
-  const industryLabel = options.industry
-    ? options.industry.replace(/-/g, " ")
-    : null;
-
-  const systemPrompt = industryLabel
-    ? `You are a lead research assistant. The source company is in the ${industryLabel} industry. Only suggest companies in the same ${industryLabel} industry. Reject generic B2B/SaaS/IT companies unless they specifically serve ${industryLabel}. Return only strict JSON: {"leads":[...]}.`
-    : 'You are a lead research assistant. Infer the website\'s industry from the domain. Return only strict JSON: {"leads":[...]}.';
-
-  const userPrompt = [
-    // Main instruction — one block depending on mode
-    options.longTailIndustrySearch
-      ? `Source: ${domain} (${options.industryLabel || industryLabel || "same industry"}). Generate ${targetCount} real same-industry companies. Focus on lesser-known, regional, niche, and emerging companies especially from: ${regionFocus}. Do not repeat famous brands.`
-      : options.industryFallback
-        ? `Source: ${domain} (${options.industryLabel}). Generate ${targetCount} real companies in the ${options.industryLabel}. Focus especially on companies from: ${regionFocus}. Include any company size — local clinics, regional firms, startups, independents, mid-market, enterprise. They must be real with working websites.`
-        : industryLabel
-          ? `Source: ${domain} (${industryLabel} industry). Generate ${targetCount} real same-industry companies from around the world, especially from: ${regionFocus}. Stay in the ${industryLabel} industry.`
-          : `Analyze ${domain}, infer its industry, then generate ${targetCount} same-industry companies from around the world.`,
-    // Seed context
-    relatedLeadSummary
-      ? `Already confirmed same-industry companies: ${relatedLeadSummary}. Generate different ones.`
-      : null,
-    // Core rules (compact)
-    "Only include companies with real, currently active websites.",
-    "Each lead: companyName, domain, description, email. Use info@domain if no specific email.",
-    "Vary results — do not repeat the same companies across calls.",
-    `Avoid the source domain: ${domain}.`,
-    excludedDomainsSample
-      ? `Skip these domains (already saved): ${excludedDomainsSample}`
-      : null,
-    '{"leads":[{"companyName":"...","domain":"...","description":"...","email":"..."}]}',
-    "Return JSON only.",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const { systemPrompt, userPrompt } = buildPrompts(domain, options);
 
   const response = await axios.post(
     `${baseUrl.replace(/\/$/, "")}/chat/completions`,
@@ -347,56 +283,11 @@ const fetchFromAIProvider = async (
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      timeout: 60000,
+      timeout: CONFIG.apiTimeout,
     },
   );
 
-  const content = response.data?.choices?.[0]?.message?.content;
-  if (!content) {
-    return [];
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    const match = content.match(/\{[\s\S]*\}/);
-    parsed = match ? JSON.parse(match[0]) : { leads: [] };
-  }
-
-  const rawLeads = Array.isArray(parsed?.leads) ? parsed.leads : [];
-
-  return rawLeads
-    .map((lead) => {
-      const normalizedDomain = String(lead.domain || "")
-        .toLowerCase()
-        .replace(/^https?:\/\//, "")
-        .replace(/^www\./, "")
-        .split("/")[0]
-        .trim();
-
-      const fallbackEmail = normalizedDomain ? `info@${normalizedDomain}` : "";
-      const normalizedEmail = String(lead.email || fallbackEmail)
-        .toLowerCase()
-        .trim();
-
-      return {
-        companyName: String(lead.companyName || "").trim(),
-        domain: normalizedDomain,
-        logoUrl: normalizedDomain
-          ? `https://logo.clearbit.com/${normalizedDomain}`
-          : undefined,
-        description: String(lead.description || "").trim(),
-        email: normalizedEmail,
-      };
-    })
-    .filter(
-      (lead) =>
-        Boolean(lead.companyName) &&
-        Boolean(lead.domain) &&
-        Boolean(lead.email) &&
-        lead.domain !== domain,
-    );
+  return parseAIResponse(response, domain);
 };
 
 const fetchFromApollo = async (domain) => {
@@ -419,11 +310,7 @@ const fetchFromApollo = async (domain) => {
 
 const fetchFromHunter = async (domain) => {
   const response = await axios.get("https://api.hunter.io/v2/domain-search", {
-    params: {
-      domain,
-      api_key: process.env.LEAD_ENRICHMENT_API_KEY,
-      limit: 50,
-    },
+    params: { domain, api_key: process.env.LEAD_ENRICHMENT_API_KEY, limit: 50 },
   });
 
   const data = response.data.data;
@@ -437,316 +324,407 @@ const fetchFromHunter = async (domain) => {
   }));
 };
 
-const fetchIndustryExpansionCompanies = async ({
-  domain,
-  provider,
-  industry,
-  verifiedLeads,
-  excludedEmailSet,
-  excludedDomainSet,
-  excludedCompanySet,
-}) => {
-  const industryLabel = industry
-    ? `${industry} industry`
-    : "the same industry as the source website";
 
-  const expansionOptions = {
-    targetCount: 160,
-    excludedDomainSet,
-    excludedCompanySet,
-    longTailIndustrySearch: true,
-    industry,
+const buildPrompts = (domain, options) => {
+  const targetCount = options.targetCount || 120;
+  const industryLabel = options.industry
+    ? options.industry.replace(/-/g, " ")
+    : null;
+  const regionFocus = getRandomRegions(3);
+
+  const excludedSample = Array.from(options.excludedDomainSet || [])
+    .slice(-15)
+    .join(", ");
+
+  const relatedSummary = (options.relatedLeads || [])
+    .slice(0, CONFIG.maxRelatedSeedLeads)
+    .map((l) => `${l.companyName} (${l.domain})`)
+    .join(", ");
+
+  const systemPrompt = industryLabel
+    ? `You are a lead research assistant. The source company is in the ${industryLabel} industry. Only suggest companies in the same ${industryLabel} industry. Reject generic B2B/SaaS/IT companies unless they specifically serve ${industryLabel}. Return only strict JSON: {"leads":[...]}.`
+    : 'You are a lead research assistant. Infer the website\'s industry from the domain. Return only strict JSON: {"leads":[...]}.';
+
+  const mainInstruction = buildMainInstruction(domain, {
+    ...options,
     industryLabel,
-    temperature: 0.9,
-    relatedLeads: verifiedLeads.slice(0, MAX_RELATED_SEED_LEADS),
-  };
+    regionFocus,
+    targetCount,
+  });
 
-  try {
-    switch (provider) {
-      case "groq":
-        return await fetchFromGroq(domain, excludedEmailSet, expansionOptions);
-      case "ai":
-      case "openai":
-        return await fetchFromAIProvider(
-          domain,
-          excludedEmailSet,
-          expansionOptions,
-        );
-      default:
-        return [];
-    }
-  } catch (error) {
-    console.error("Industry expansion generation error:", error.message);
-    return [];
-  }
+  const userPrompt = [
+    mainInstruction,
+    relatedSummary
+      ? `Already confirmed same-industry companies: ${relatedSummary}. Generate different ones.`
+      : null,
+    "Only include companies with real, currently active websites.",
+    "Each lead: companyName, domain, description, email. Use info@domain if no specific email.",
+    "Vary results — do not repeat the same companies across calls.",
+    `Avoid the source domain: ${domain}.`,
+    excludedSample
+      ? `Skip these domains (already saved): ${excludedSample}`
+      : null,
+    '{"leads":[{"companyName":"...","domain":"...","description":"...","email":"..."}]}',
+    "Return JSON only.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return { systemPrompt, userPrompt };
 };
 
-const fetchIndustryFallbackCompanies = async ({
-  domain,
-  provider,
-  industry,
-  verifiedLeads,
-  excludedEmailSet,
-  excludedDomainSet,
-  excludedCompanySet,
-}) => {
-  const industryLabel = industry
-    ? `${industry} industry`
-    : "the same industry as the source website";
+const buildMainInstruction = (domain, opts) => {
+  const { industryLabel, regionFocus, targetCount } = opts;
+  const ph = `Prioritize companies based in the ${CONFIG.priorityRegion} first`;
 
-  const industryOptions = {
-    targetCount: 200,
-    excludedDomainSet,
-    excludedCompanySet,
-    industryFallback: true,
-    industry,
-    industryLabel,
-    temperature: 1.0,
-    relatedLeads: verifiedLeads.slice(0, MAX_RELATED_SEED_LEADS),
-  };
-
-  try {
-    switch (provider) {
-      case "groq":
-        return await fetchFromGroq(domain, excludedEmailSet, industryOptions);
-      case "ai":
-      case "openai":
-        return await fetchFromAIProvider(
-          domain,
-          excludedEmailSet,
-          industryOptions,
-        );
-      default:
-        return generatePopularFallbackLeads(domain, verifiedLeads, industry);
-    }
-  } catch (error) {
-    console.error("Industry fallback generation error:", error.message);
-    return generatePopularFallbackLeads(domain, verifiedLeads, industry);
+  if (opts.longTailIndustrySearch) {
+    return `Source: ${domain} (${opts.industryLabel || industryLabel || "same industry"}). Generate ${targetCount} real same-industry companies. ${ph}, then include lesser-known, regional, niche, and emerging companies from: ${regionFocus}. Do not repeat famous brands.`;
   }
+  if (opts.industryFallback) {
+    return `Source: ${domain} (${opts.industryLabel}). Generate ${targetCount} real companies in the ${opts.industryLabel}. ${ph}, then include companies from: ${regionFocus}. Include any company size — local clinics, regional firms, startups, independents, mid-market, enterprise. They must be real with working websites.`;
+  }
+  if (industryLabel) {
+    return `Source: ${domain} (${industryLabel} industry). Generate ${targetCount} real same-industry companies. ${ph}, then include companies from around the world, especially from: ${regionFocus}. Stay in the ${industryLabel} industry.`;
+  }
+  return `Analyze ${domain}, infer its industry, then generate ${targetCount} same-industry companies. ${ph}, then include companies from around the world.`;
 };
 
-const fetchSupplementalCompanies = async ({
-  domain,
-  industry,
-  provider,
-  verifiedLeads,
-  excludedEmailSet,
-  excludedDomainSet,
-  excludedCompanySet,
-}) => {
-  if (!verifiedLeads.length) {
-    return [];
-  }
 
+const parseAIResponse = (response, sourceDomain) => {
+  const content = response.data?.choices?.[0]?.message?.content;
+  if (!content) return [];
+
+  let parsed;
   try {
-    switch (provider) {
-      case "groq":
-        return await fetchFromGroq(domain, excludedEmailSet, {
-          industry,
-          relatedLeads: verifiedLeads,
-          targetCount: 120,
-          temperature: 0.8,
-          excludedDomainSet,
-          excludedCompanySet,
-        });
-      case "ai":
-      case "openai":
-        return await fetchFromAIProvider(domain, excludedEmailSet, {
-          industry,
-          relatedLeads: verifiedLeads,
-          targetCount: 120,
-          temperature: 0.8,
-          excludedDomainSet,
-          excludedCompanySet,
-        });
-      default:
-        return generatePopularFallbackLeads(domain, verifiedLeads, industry);
-    }
-  } catch (error) {
-    console.error("Supplemental lead generation error:", error.message);
-    return generatePopularFallbackLeads(domain, verifiedLeads, industry);
+    parsed = JSON.parse(content);
+  } catch {
+    const match = content.match(/\{[\s\S]*\}/);
+    parsed = match ? JSON.parse(match[0]) : { leads: [] };
   }
-};
 
-const normalizeLeadResults = (
-  companies,
-  domain,
-  { excludedEmailSet, excludedDomainSet, excludedCompanySet },
-) => {
-  return companies
-    .map((c) => {
-      const normalizedDomain = normalizeDomain(c.domain || domain);
-      const normalizedEmail = (
-        c.email || `info@${normalizedDomain}`
-      ).toLowerCase();
-      const normalizedCompanyName = normalizeCompanyName(c.companyName);
+  return (Array.isArray(parsed?.leads) ? parsed.leads : [])
+    .map((lead) => {
+      const domain = normalizeDomain(lead.domain || "");
+      const email = String(lead.email || (domain ? `info@${domain}` : ""))
+        .toLowerCase()
+        .trim();
 
       return {
-        companyName: c.companyName,
-        domain: normalizedDomain,
-        logoUrl: c.logoUrl || `https://logo.clearbit.com/${normalizedDomain}`,
-        description: c.description || "",
-        email: normalizedEmail,
-        isSaved: false,
-        normalizedCompanyName,
+        companyName: String(lead.companyName || "").trim(),
+        domain,
+        logoUrl: domain ? `https://logo.clearbit.com/${domain}` : undefined,
+        description: String(lead.description || "").trim(),
+        email,
       };
     })
     .filter(
-      (lead) =>
-        Boolean(lead.companyName) &&
-        Boolean(lead.email) &&
-        Boolean(lead.domain) &&
-        !excludedEmailSet.has(lead.email) &&
-        !excludedDomainSet.has(lead.domain) &&
-        !excludedCompanySet.has(lead.normalizedCompanyName),
+      (l) => l.companyName && l.domain && l.email && l.domain !== sourceDomain,
     );
 };
 
-const dedupeLeads = (leads) => {
-  return Array.from(
+
+const normalizeLeadResults = (companies, domain, exclusions) => {
+  // Support both {emails,domains,companies} and legacy key names
+  const emailSet = exclusions.emails || exclusions.excludedEmailSet;
+  const domainSet = exclusions.domains || exclusions.excludedDomainSet;
+  const companySet = exclusions.companies || exclusions.excludedCompanySet;
+
+  return companies
+    .map((c) => {
+      const d = normalizeDomain(c.domain || domain);
+      const email = (c.email || `info@${d}`).toLowerCase();
+      const companyKey = normalizeCompanyName(c.companyName);
+
+      return {
+        companyName: c.companyName,
+        domain: d,
+        logoUrl: c.logoUrl || `https://logo.clearbit.com/${d}`,
+        description: c.description || "",
+        email,
+        isSaved: false,
+        normalizedCompanyName: companyKey,
+      };
+    })
+    .filter(
+      (l) =>
+        l.companyName &&
+        l.email &&
+        l.domain &&
+        !emailSet.has(l.email) &&
+        !domainSet.has(l.domain) &&
+        !companySet.has(l.normalizedCompanyName),
+    );
+};
+
+const dedupeLeads = (leads) =>
+  Array.from(
     new Map(
-      leads.map((lead) => [
-        `${lead.email}|${lead.domain}|${lead.normalizedCompanyName}`,
-        lead,
+      leads.map((l) => [
+        `${l.email}|${l.domain}|${l.normalizedCompanyName}`,
+        l,
       ]),
     ).values(),
   );
-};
+
 
 const filterLiveLeads = async (leads, limit) => {
   const verified = [];
-  let currentIndex = 0;
+  let idx = 0;
 
   const worker = async () => {
-    while (currentIndex < leads.length && verified.length < limit) {
-      const lead = leads[currentIndex++];
-
-      if (await hasLiveWebsite(lead.domain)) {
-        verified.push(lead);
-      }
+    while (idx < leads.length && verified.length < limit) {
+      const lead = leads[idx++];
+      if (await hasLiveWebsite(lead.domain)) verified.push(lead);
     }
   };
 
-  await Promise.all(
-    Array.from(
-      { length: Math.min(LIVE_DOMAIN_CHECK_CONCURRENCY, leads.length) },
-      () => worker(),
-    ),
-  );
-
+  const poolSize = Math.min(CONFIG.domainCheckConcurrency, leads.length);
+  await Promise.all(Array.from({ length: poolSize }, () => worker()));
   return verified.slice(0, limit);
 };
 
-const hasLiveWebsite = async (domain) => {
-  const normalizedDomain = normalizeDomain(domain);
+const hasLiveWebsite = async (rawDomain) => {
+  const domain = normalizeDomain(rawDomain);
+  if (!domain) return false;
 
-  if (!normalizedDomain) {
-    return false;
-  }
+  const variants = [
+    domain,
+    domain.startsWith("www.") ? domain.slice(4) : `www.${domain}`,
+  ];
+  const uniqueHosts = [...new Set(variants)];
 
-  const hostsToResolve = Array.from(
-    new Set([
-      normalizedDomain,
-      normalizedDomain.startsWith("www.")
-        ? normalizedDomain.slice(4)
-        : `www.${normalizedDomain}`,
-    ]),
-  );
-
-  let hasDnsRecord = false;
-
-  for (const host of hostsToResolve) {
+  let dnsOk = false;
+  for (const host of uniqueHosts) {
     try {
       await dns.lookup(host);
-      hasDnsRecord = true;
+      dnsOk = true;
       break;
     } catch {}
   }
+  if (!dnsOk) return false;
 
-  if (!hasDnsRecord) {
-    return false;
-  }
+  const urls = [
+    `https://${domain}`,
+    domain.startsWith("www.") ? null : `https://www.${domain}`,
+    `http://${domain}`,
+  ].filter(Boolean);
 
-  const urlsToCheck = Array.from(
-    new Set(
-      [
-        `https://${normalizedDomain}`,
-        normalizedDomain.startsWith("www.")
-          ? ""
-          : `https://www.${normalizedDomain}`,
-        `http://${normalizedDomain}`,
-      ].filter(Boolean),
-    ),
-  );
-
-  for (const url of urlsToCheck) {
+  for (const url of [...new Set(urls)]) {
     try {
-      const response = await axios.get(url, {
-        timeout: 4000,
+      const res = await axios.get(url, {
+        timeout: CONFIG.domainCheckTimeout,
         maxRedirects: 5,
-        maxContentLength: 250000,
-        maxBodyLength: 250000,
-        validateStatus: (status) => status >= 200 && status < 500,
+        maxContentLength: 250_000,
+        maxBodyLength: 250_000,
+        validateStatus: (s) => s >= 200 && s < 500,
         headers: {
           "User-Agent": "TrackLeadsBot/1.0",
           Accept: "text/html,application/xhtml+xml",
         },
       });
-
-      if (isLikelyLiveWebsiteResponse(response)) {
-        return true;
-      }
+      if (isLiveResponse(res)) return true;
     } catch {}
   }
 
   return false;
 };
 
-const isLikelyLiveWebsiteResponse = (response) => {
+const DEAD_SITE_SIGNALS = [
+  "domain for sale",
+  "buy this domain",
+  "this domain is for sale",
+  "parked free",
+  "sedo domain parking",
+  "hugedomains.com",
+  "godaddy auctions",
+  "website coming soon",
+  "coming soon",
+  "page not found",
+  "404 not found",
+  "site not found",
+  "website is no longer available",
+  "domain is available",
+  "this site can't be reached",
+];
+
+const isLiveResponse = (response) => {
   const status = Number(response?.status || 0);
-
-  if (!status) {
-    return false;
-  }
-
-  if ([401, 403, 405].includes(status)) {
-    return true;
-  }
-
-  if (status < 200 || status >= 400) {
-    return false;
-  }
+  if (!status) return false;
+  if ([401, 403, 405].includes(status)) return true;
+  if (status < 200 || status >= 400) return false;
 
   const contentType = String(
     response?.headers?.["content-type"] || "",
   ).toLowerCase();
+  if (contentType && !contentType.includes("text/html")) return false;
+
   const body =
     typeof response?.data === "string" ? response.data.toLowerCase() : "";
-
-  if (contentType && !contentType.includes("text/html")) {
-    return false;
-  }
-
-  const deadSiteSignals = [
-    "domain for sale",
-    "buy this domain",
-    "this domain is for sale",
-    "parked free",
-    "sedo domain parking",
-    "hugedomains.com",
-    "godaddy auctions",
-    "website coming soon",
-    "coming soon",
-    "page not found",
-    "404 not found",
-    "site not found",
-    "website is no longer available",
-    "domain is available",
-    "this site can't be reached",
-  ];
-
-  return !deadSiteSignals.some((signal) => body.includes(signal));
+  return !DEAD_SITE_SIGNALS.some((signal) => body.includes(signal));
 };
+
+
+const INDUSTRY_KEYWORDS = {
+  healthcare: [
+    "medical",
+    "health",
+    "hospital",
+    "clinic",
+    "pharma",
+    "dental",
+    "doctor",
+    "patient",
+    "care",
+    "wellness",
+    "nursing",
+    "surgery",
+    "therapy",
+    "biotech",
+    "lab",
+    "diagnostic",
+    "radiology",
+    "ortho",
+    "cardio",
+    "oncology",
+    "pediatric",
+    "med",
+    "rx",
+    "drug",
+    "vaccine",
+    "ehr",
+    "emr",
+    "telemedicine",
+    "telehealth",
+  ],
+  finance: [
+    "bank",
+    "finance",
+    "fintech",
+    "invest",
+    "insurance",
+    "mortgage",
+    "loan",
+    "credit",
+    "accounting",
+    "tax",
+    "wealth",
+    "trading",
+    "capital",
+    "asset",
+    "fund",
+    "equity",
+    "securities",
+    "brokerage",
+    "payment",
+    "payroll",
+    "ledger",
+    "crypto",
+    "blockchain",
+  ],
+  education: [
+    "school",
+    "university",
+    "college",
+    "edu",
+    "learn",
+    "education",
+    "training",
+    "course",
+    "academic",
+    "tutoring",
+    "elearning",
+    "curriculum",
+    "student",
+    "teacher",
+    "classroom",
+    "campus",
+  ],
+  retail: [
+    "shop",
+    "store",
+    "retail",
+    "ecommerce",
+    "commerce",
+    "marketplace",
+    "cart",
+    "merchandise",
+    "goods",
+    "brand",
+    "apparel",
+    "fashion",
+    "grocery",
+    "supermarket",
+    "outlet",
+    "boutique",
+  ],
+  hospitality: [
+    "hotel",
+    "resort",
+    "travel",
+    "tourism",
+    "hospitality",
+    "airline",
+    "booking",
+    "vacation",
+    "restaurant",
+    "food",
+    "dining",
+    "chef",
+    "catering",
+    "lodging",
+    "inn",
+    "motel",
+    "cruise",
+    "spa",
+  ],
+  manufacturing: [
+    "manufactur",
+    "factory",
+    "industrial",
+    "engineering",
+    "construction",
+    "logistics",
+    "supply chain",
+    "warehouse",
+    "production",
+    "assembly",
+    "machining",
+    "fabrication",
+    "automotive",
+    "aerospace",
+    "chemical",
+  ],
+  legal: [
+    "law",
+    "legal",
+    "attorney",
+    "counsel",
+    "firm",
+    "justice",
+    "litigation",
+    "paralegal",
+    "barrister",
+    "solicitor",
+    "notary",
+    "compliance",
+    "regulatory",
+    "contract",
+  ],
+};
+
+const inferIndustryFromContext = (domain, verifiedLeads = []) => {
+  const descriptions = verifiedLeads
+    .slice(0, 8)
+    .map((l) => (l.description || "").toLowerCase())
+    .join(" ");
+  const context = `${domain.toLowerCase()} ${descriptions}`;
+
+  for (const [industry, keywords] of Object.entries(INDUSTRY_KEYWORDS)) {
+    if (keywords.some((kw) => context.includes(kw))) return industry;
+  }
+  return null;
+};
+
 
 const INDUSTRY_POOLS = {
   healthcare: [
@@ -989,233 +967,24 @@ const INDUSTRY_POOLS = {
   ],
 };
 
-const generatePopularFallbackLeads = (
-  domain,
-  existingLeads = [],
-  industry = null,
-) => {
-  const pool =
-    industry && INDUSTRY_POOLS[industry]
-      ? INDUSTRY_POOLS[industry]
-      : INDUSTRY_POOLS.default;
-
-  const existingSummary = existingLeads
+const generateFallbackLeads = (domain, existingLeads = [], industry = null) => {
+  const pool = (industry && INDUSTRY_POOLS[industry]) || INDUSTRY_POOLS.default;
+  const label = industry || "B2B";
+  const existing = existingLeads
     .slice(0, 5)
-    .map((lead) => lead.companyName)
+    .map((l) => l.companyName)
     .join(", ");
 
-  const industryLabel = industry || "B2B";
-
-  return pool.map((company) => ({
-    companyName: company.companyName,
-    domain: company.domain,
-    logoUrl: `https://logo.clearbit.com/${company.domain}`,
-    description: existingSummary
-      ? `${company.companyName} is a well-known ${industryLabel} company added as a fallback after prioritizing same-industry leads such as ${existingSummary}.`
-      : `${company.companyName} is a well-known ${industryLabel} company added as a fallback when same-industry results are limited for ${domain}.`,
-    email: `partnerships@${company.domain}`,
+  return pool.map((c) => ({
+    companyName: c.companyName,
+    domain: c.domain,
+    logoUrl: `https://logo.clearbit.com/${c.domain}`,
+    description: existing
+      ? `${c.companyName} is a well-known ${label} company added as a fallback after prioritizing same-industry leads such as ${existing}.`
+      : `${c.companyName} is a well-known ${label} company added as a fallback when same-industry results are limited for ${domain}.`,
+    email: `partnerships@${c.domain}`,
   }));
 };
 
-const inferIndustryFromContext = (domain, verifiedLeads = []) => {
-  const domainStr = domain.toLowerCase();
-  const leadDescriptions = verifiedLeads
-    .slice(0, 8)
-    .map((l) => (l.description || "").toLowerCase())
-    .join(" ");
-  const context = `${domainStr} ${leadDescriptions}`;
-
-  const industryPatterns = [
-    {
-      key: "healthcare",
-      keywords: [
-        "medical",
-        "health",
-        "hospital",
-        "clinic",
-        "pharma",
-        "dental",
-        "doctor",
-        "patient",
-        "care",
-        "wellness",
-        "nursing",
-        "surgery",
-        "therapy",
-        "biotech",
-        "lab",
-        "diagnostic",
-        "radiology",
-        "ortho",
-        "cardio",
-        "oncology",
-        "pediatric",
-        "med",
-        "rx",
-        "drug",
-        "vaccine",
-        "ehr",
-        "emr",
-        "telemedicine",
-        "telehealth",
-      ],
-    },
-    {
-      key: "finance",
-      keywords: [
-        "bank",
-        "finance",
-        "fintech",
-        "invest",
-        "insurance",
-        "mortgage",
-        "loan",
-        "credit",
-        "accounting",
-        "tax",
-        "wealth",
-        "trading",
-        "capital",
-        "asset",
-        "fund",
-        "equity",
-        "securities",
-        "brokerage",
-        "payment",
-        "payroll",
-        "ledger",
-        "crypto",
-        "blockchain",
-      ],
-    },
-    {
-      key: "education",
-      keywords: [
-        "school",
-        "university",
-        "college",
-        "edu",
-        "learn",
-        "education",
-        "training",
-        "course",
-        "academic",
-        "tutoring",
-        "elearning",
-        "curriculum",
-        "student",
-        "teacher",
-        "classroom",
-        "campus",
-      ],
-    },
-    {
-      key: "retail",
-      keywords: [
-        "shop",
-        "store",
-        "retail",
-        "ecommerce",
-        "commerce",
-        "marketplace",
-        "cart",
-        "merchandise",
-        "goods",
-        "brand",
-        "apparel",
-        "fashion",
-        "grocery",
-        "supermarket",
-        "outlet",
-        "boutique",
-      ],
-    },
-    {
-      key: "hospitality",
-      keywords: [
-        "hotel",
-        "resort",
-        "travel",
-        "tourism",
-        "hospitality",
-        "airline",
-        "booking",
-        "vacation",
-        "restaurant",
-        "food",
-        "dining",
-        "chef",
-        "catering",
-        "lodging",
-        "inn",
-        "motel",
-        "cruise",
-        "spa",
-      ],
-    },
-    {
-      key: "manufacturing",
-      keywords: [
-        "manufactur",
-        "factory",
-        "industrial",
-        "engineering",
-        "construction",
-        "logistics",
-        "supply chain",
-        "warehouse",
-        "production",
-        "assembly",
-        "machining",
-        "fabrication",
-        "automotive",
-        "aerospace",
-        "chemical",
-      ],
-    },
-    {
-      key: "legal",
-      keywords: [
-        "law",
-        "legal",
-        "attorney",
-        "counsel",
-        "firm",
-        "justice",
-        "litigation",
-        "paralegal",
-        "barrister",
-        "solicitor",
-        "notary",
-        "compliance",
-        "regulatory",
-        "contract",
-      ],
-    },
-  ];
-
-  for (const pattern of industryPatterns) {
-    if (pattern.keywords.some((kw) => context.includes(kw))) {
-      return pattern.key;
-    }
-  }
-
-  return null;
-};
-
-const normalizeDomain = (value) =>
-  String(value || "")
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .split("/")[0]
-    .trim();
-
-const normalizeCompanyName = (value) =>
-  String(value || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
 
 module.exports = { generateLeadsFromWebsite };
