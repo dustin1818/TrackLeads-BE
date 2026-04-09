@@ -1,9 +1,9 @@
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 
-const OTP_EXPIRY_MINUTES = 10;
+const PENDING_REGISTRATION_TTL_SECONDS = 60 * 60 * 24;
 
-const userSchema = new mongoose.Schema(
+const pendingRegistrationSchema = new mongoose.Schema(
   {
     name: {
       type: String,
@@ -24,10 +24,6 @@ const userSchema = new mongoose.Schema(
       minlength: [8, "Password must be at least 8 characters"],
       select: false,
     },
-    isVerified: {
-      type: Boolean,
-      default: false,
-    },
     verificationOtp: {
       type: String,
       select: false,
@@ -36,17 +32,18 @@ const userSchema = new mongoose.Schema(
       type: Date,
       select: false,
     },
-    avatar: {
-      type: String,
-      default: "",
-    },
   },
   {
     timestamps: true,
   },
 );
 
-userSchema.pre("save", async function (next) {
+pendingRegistrationSchema.index(
+  { updatedAt: 1 },
+  { expireAfterSeconds: PENDING_REGISTRATION_TTL_SECONDS },
+);
+
+pendingRegistrationSchema.pre("save", async function (next) {
   if (this.$locals?.skipPasswordHash || !this.isModified("password")) {
     return next();
   }
@@ -55,10 +52,7 @@ userSchema.pre("save", async function (next) {
   this.password = await bcrypt.hash(this.password, salt);
 });
 
-userSchema.methods.matchPassword = async function (enteredPassword) {
-  return await bcrypt.compare(enteredPassword, this.password);
-};
-
-userSchema.statics.OTP_EXPIRY_MINUTES = OTP_EXPIRY_MINUTES;
-
-module.exports = mongoose.model("User", userSchema);
+module.exports = mongoose.model(
+  "PendingRegistration",
+  pendingRegistrationSchema,
+);
