@@ -133,14 +133,17 @@ const fetchFromAIProvider = async (
   const excludedEmails = Array.from(excludedEmailSet).slice(0, 250).join(", ");
 
   const systemPrompt =
-    "You are a B2B lead research assistant. Return only strict JSON with a top-level array field named leads.";
+    "You are a lead research assistant. First infer the website's likely industry, audience, and commercial model from the provided domain. Then return only strict JSON with a top-level array field named leads.";
 
   const userPrompt = [
-    `Generate 120 realistic B2B lead companies complementary to the business domain ${domain}.`,
-    "Prioritize larger, well-known companies and high-growth scaleups.",
-    "Prefer brand scale similar to: Webflow, Envato, Shopify, HubSpot, Atlassian, Slack, Adobe, Notion, Canva, Stripe.",
+    `Analyze the business domain ${domain} and infer the company's likely industry or niche.`,
+    `Generate 120 realistic lead companies that complement the business behind ${domain} based on that inferred industry.`,
+    "Do not limit results to generic B2B software companies. The leads can be B2B, B2C, ecommerce, agencies, marketplaces, healthcare, education, finance, media, logistics, hospitality, real estate, nonprofits, or other sectors if they fit the inferred industry.",
+    "Prefer companies that are natural prospects, channel partners, integration partners, strategic partners, referral partners, suppliers, distributors, or ecosystem fits for the website's industry.",
+    "Prioritize industry relevance first, then brand quality, market presence, and realistic fit.",
     "Vary results on each request so the list is not repetitive.",
     "Each lead must include: companyName, domain, description, email.",
+    "Descriptions should briefly explain why the company complements the website's business domain or industry.",
     "Use unique company domains and valid business-like emails.",
     "Avoid returning the user's own domain.",
     excludedEmails
