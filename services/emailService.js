@@ -80,7 +80,7 @@ const sendVerificationOtpEmail = async ({
     "TrackLeads <onboarding@resend.dev>";
 
   if (resend) {
-    const { error } = await resend.emails.send({
+    const { data, error } = await resend.emails.send({
       from,
       to: email,
       subject: emailContent.subject,
@@ -89,10 +89,11 @@ const sendVerificationOtpEmail = async ({
     });
 
     if (error) {
+      console.error("Resend email error:", JSON.stringify(error));
       throw new Error(error.message || "Failed to send verification email");
     }
 
-    console.log(`OTP email sent through Resend to ${email}`);
+    console.log(`OTP email sent through Resend to ${email}`, data);
     return null;
   }
 

@@ -112,6 +112,7 @@ const sendPersistenceOrServerError = (res, error) => {
     return res.status(400).json({ message: validationMessage });
   }
 
+  console.error("Server error:", error);
   return res.status(500).json({ message: "Server error" });
 };
 
