@@ -3,6 +3,7 @@ const { Resend } = require("resend");
 
 let transporterPromise;
 let resendClient;
+let gmailTransporter;
 
 const createPreviewTransporter = async () => {
   const testAccount = await nodemailer.createTestAccount();
@@ -16,6 +17,24 @@ const createPreviewTransporter = async () => {
       pass: testAccount.pass,
     },
   });
+};
+
+const getGmailTransporter = () => {
+  const user = process.env.GMAIL_USER;
+  const pass = process.env.GMAIL_APP_PASSWORD;
+
+  if (!user || !pass) {
+    return null;
+  }
+
+  if (!gmailTransporter) {
+    gmailTransporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: { user, pass },
+    });
+  }
+
+  return gmailTransporter;
 };
 
 const getResendClient = () => {
@@ -74,11 +93,28 @@ const sendVerificationOtpEmail = async ({
 }) => {
   const emailContent = buildEmailContent({ name, otp, expiresInMinutes });
   const resend = getResendClient();
+  const gmail = getGmailTransporter();
   const from =
+    process.env.GMAIL_USER ||
     process.env.RESEND_FROM_EMAIL ||
     process.env.EMAIL_FROM ||
     "TrackLeads <onboarding@resend.dev>";
 
+  // 1. Try Gmail SMTP
+  if (gmail) {
+    await gmail.sendMail({
+      from: `TrackLeads <${process.env.GMAIL_USER}>`,
+      to: email,
+      subject: emailContent.subject,
+      text: emailContent.text,
+      html: emailContent.html,
+    });
+
+    console.log(`OTP email sent through Gmail to ${email}`);
+    return null;
+  }
+
+  // 2. Try Resend
   if (resend) {
     const { data, error } = await resend.emails.send({
       from,
@@ -88,13 +124,15 @@ const sendVerificationOtpEmail = async ({
       html: emailContent.html,
     });
 
-    if (error) {
-      console.error("Resend email error:", JSON.stringify(error));
-      throw new Error(error.message || "Failed to send verification email");
+    if (!error) {
+      console.log(`OTP email sent through Resend to ${email}`, data);
+      return null;
     }
 
-    console.log(`OTP email sent through Resend to ${email}`, data);
-    return null;
+    console.warn(
+      "Resend email failed, falling back to preview:",
+      error.message,
+    );
   }
 
   const transporter = await getPreviewTransporter();

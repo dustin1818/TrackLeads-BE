@@ -113,9 +113,7 @@ const sendPersistenceOrServerError = (res, error) => {
   }
 
   console.error("Server error:", error);
-  return res
-    .status(500)
-    .json({ message: "Server error", debug: error.message });
+  return res.status(500).json({ message: "Server error" });
 };
 
 const getOtpValidationError = (user, otp) => {
