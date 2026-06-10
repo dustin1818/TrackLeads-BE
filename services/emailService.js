@@ -102,21 +102,57 @@ const sendVerificationOtpEmail = async ({
 
   // 1. Try Gmail SMTP
   if (gmail) {
-    await gmail.sendMail({
-      from: `TrackLeads <${process.env.GMAIL_USER}>`,
-      to: email,
-      subject: emailContent.subject,
-      text: emailContent.text,
-      html: emailContent.html,
-    });
+    try {
+      await gmail.sendMail({
+        from: `TrackLeads <${process.env.GMAIL_USER}>`,
+        to: email,
+        subject: emailContent.subject,
+        text: emailContent.text,
+        html: emailContent.html,
+      });
 
-    console.log(`OTP email sent through Gmail to ${email}`);
-    return null;
+      console.log(`OTP email sent through Gmail to ${email}`);
+      return null;
+    } catch (err) {
+      console.warn(
+        "Gmail send failed, falling back to next provider:",
+        err?.message || err,
+      );
+    }
   }
 
   // 2. Try Resend
   if (resend) {
-    const { data, error } = await resend.emails.send({
+    try {
+      const { data, error } = await resend.emails.send({
+        from,
+        to: email,
+        subject: emailContent.subject,
+        text: emailContent.text,
+        html: emailContent.html,
+      });
+
+      if (!error) {
+        console.log(`OTP email sent through Resend to ${email}`, data);
+        return null;
+      }
+
+      console.warn(
+        "Resend email failed, falling back to preview:",
+        error?.message || error,
+      );
+    } catch (err) {
+      console.warn(
+        "Resend send threw, falling back to preview:",
+        err?.message || err,
+      );
+    }
+  }
+
+  try {
+    const transporter = await getPreviewTransporter();
+
+    const info = await transporter.sendMail({
       from,
       to: email,
       subject: emailContent.subject,
@@ -124,34 +160,20 @@ const sendVerificationOtpEmail = async ({
       html: emailContent.html,
     });
 
-    if (!error) {
-      console.log(`OTP email sent through Resend to ${email}`, data);
-      return null;
+    const previewUrl = nodemailer.getTestMessageUrl(info) || null;
+
+    if (previewUrl) {
+      console.log(`OTP email preview for ${email}: ${previewUrl}`);
     }
 
+    return previewUrl;
+  } catch (err) {
     console.warn(
-      "Resend email failed, falling back to preview:",
-      error.message,
+      "Preview transporter failed, continuing without preview:",
+      err?.message || err,
     );
+    return null;
   }
-
-  const transporter = await getPreviewTransporter();
-
-  const info = await transporter.sendMail({
-    from,
-    to: email,
-    subject: emailContent.subject,
-    text: emailContent.text,
-    html: emailContent.html,
-  });
-
-  const previewUrl = nodemailer.getTestMessageUrl(info) || null;
-
-  if (previewUrl) {
-    console.log(`OTP email preview for ${email}: ${previewUrl}`);
-  }
-
-  return previewUrl;
 };
 
 module.exports = {
