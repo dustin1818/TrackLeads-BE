@@ -23,13 +23,13 @@ const getGmailTransporter = () => {
   const user = process.env.GMAIL_USER;
   const pass = process.env.GMAIL_APP_PASSWORD;
 
-  if (!user || !pass) {
-    return null;
-  }
+  if (!user || !pass) return null;
 
   if (!gmailTransporter) {
     gmailTransporter = nodemailer.createTransport({
-      service: "gmail",
+      host: "smtp.gmail.com",
+      port: 587,
+      secure: false,
       auth: { user, pass },
     });
   }
@@ -52,6 +52,10 @@ const getResendClient = () => {
 };
 
 const getPreviewTransporter = async () => {
+  if (process.env.NODE_ENV === "production") {
+    return null;
+  }
+
   if (!transporterPromise) {
     transporterPromise = createPreviewTransporter();
   }
@@ -151,6 +155,11 @@ const sendVerificationOtpEmail = async ({
 
   try {
     const transporter = await getPreviewTransporter();
+
+    if (!transporter) {
+      console.warn("No email provider configured — email skipped.");
+      return null;
+    }
 
     const info = await transporter.sendMail({
       from,
